@@ -3,11 +3,15 @@
 //! Skills are user-defined prompts stored as Markdown files that can be invoked
 //! by the user via slash commands (e.g., /commit) or by the model via this tool.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::implementations::grok_build::read_file::{
     READ_FILE_MAX_BYTES, READ_FILE_MAX_TOKENS, exceeds_read_cap,
 };
 use crate::implementations::skills::types::SkillInfo;
 use crate::util::truncate::floor_char_boundary;
+
+const PSTACK_PLUGIN_NAME: &str = "pstack";
 
 /// Input for the Skill tool
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -140,6 +144,95 @@ pub fn format_skill_name(skill: &SkillInfo) -> String {
         return format!("{pn}:{}", skill.name);
     }
     format!("{}:{}", skill.scope.as_ref(), skill.name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvertisedSpellings {
+    /// Lowercased [`format_skill_name`]. No bare key.
+    Qualified(String),
+    /// `listing` is [`SkillInfo::name`]. `bare` and `qualified` are lowercased.
+    BareUnlessContested {
+        listing: String,
+        bare: String,
+        qualified: String,
+    },
+}
+
+impl AdvertisedSpellings {
+    pub fn counted_keys(&self) -> impl Iterator<Item = &str> + '_ {
+        let pair = match self {
+            Self::Qualified(qualified) => [Some(qualified.as_str()), None],
+            Self::BareUnlessContested {
+                bare, qualified, ..
+            } => [Some(bare.as_str()), Some(qualified.as_str())],
+        };
+        pair.into_iter().flatten()
+    }
+}
+
+/// Spellings for `skill`. `Qualified` only when `plugin_name` is exactly [`PSTACK_PLUGIN_NAME`].
+pub fn advertised_spellings(skill: &SkillInfo) -> AdvertisedSpellings {
+    let qualified = format_skill_name(skill).to_lowercase();
+    if skill.plugin_name.as_deref() == Some(PSTACK_PLUGIN_NAME) {
+        return AdvertisedSpellings::Qualified(qualified);
+    }
+    AdvertisedSpellings::BareUnlessContested {
+        listing: skill.name.clone(),
+        bare: skill.name.to_lowercase(),
+        qualified,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenSlashName {
+    pub token: Option<String>,
+    pub collides_with: Option<String>,
+}
+
+pub fn choose_advertised_name(
+    skill: &SkillInfo,
+    bare_counts: &HashMap<String, usize>,
+    qualified_counts: &HashMap<String, usize>,
+    blocked: &HashSet<String>,
+) -> ChosenSlashName {
+    fn free(counts: &HashMap<String, usize>, key: &str, blocked: &HashSet<String>) -> bool {
+        counts.get(key).copied() == Some(1) && !blocked.contains(key)
+    }
+    match advertised_spellings(skill) {
+        AdvertisedSpellings::Qualified(qualified) => {
+            if free(qualified_counts, &qualified, blocked) {
+                ChosenSlashName {
+                    token: Some(qualified),
+                    collides_with: None,
+                }
+            } else {
+                ChosenSlashName {
+                    token: None,
+                    collides_with: Some(qualified),
+                }
+            }
+        }
+        AdvertisedSpellings::BareUnlessContested {
+            bare, qualified, ..
+        } => {
+            if free(bare_counts, &bare, blocked) {
+                ChosenSlashName {
+                    token: Some(bare),
+                    collides_with: None,
+                }
+            } else if free(qualified_counts, &qualified, blocked) {
+                ChosenSlashName {
+                    token: Some(qualified),
+                    collides_with: Some(skill.name.clone()),
+                }
+            } else {
+                ChosenSlashName {
+                    token: None,
+                    collides_with: Some(skill.name.clone()),
+                }
+            }
+        }
+    }
 }
 
 /// Extract a clean display string from skill XML markup. Returns `Some("/NAME ARGS")` if the text
@@ -513,6 +606,8 @@ pub async fn load_skill_with_body(skill: &SkillInfo) -> Result<SkillInfo, String
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::*;
     use crate::implementations::skills::types::SkillScope;
 
@@ -1383,5 +1478,124 @@ Review code.
         let body = "See [escape](../../secret.md) here.";
         let result = resolve_skill_internal_links(body, &skill_dir);
         assert_eq!(result, body);
+    }
+
+    fn named(name: &str, plugin: Option<&str>) -> SkillInfo {
+        SkillInfo {
+            name: name.to_owned(),
+            scope: if plugin.is_some() {
+                SkillScope::Plugin
+            } else {
+                SkillScope::Local
+            },
+            plugin_name: plugin.map(str::to_owned),
+            ..SkillInfo::default()
+        }
+    }
+
+    fn count_map(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
+        pairs
+            .iter()
+            .map(|(key, n)| ((*key).to_owned(), *n))
+            .collect()
+    }
+
+    #[test]
+    fn advertised_spellings_qualifies_exact_pstack_only() {
+        let pstack = advertised_spellings(&named("how", Some("pstack")));
+        assert_eq!(
+            pstack,
+            AdvertisedSpellings::Qualified("pstack:how".to_owned())
+        );
+        assert_eq!(
+            pstack.counted_keys().collect::<Vec<_>>(),
+            vec!["pstack:how"]
+        );
+
+        let acme = advertised_spellings(&named("deploy", Some("acme")));
+        assert_eq!(
+            acme,
+            AdvertisedSpellings::BareUnlessContested {
+                listing: "deploy".to_owned(),
+                bare: "deploy".to_owned(),
+                qualified: "acme:deploy".to_owned(),
+            }
+        );
+        let mut acme_keys: Vec<&str> = acme.counted_keys().collect();
+        acme_keys.sort_unstable();
+        assert_eq!(acme_keys, vec!["acme:deploy", "deploy"]);
+
+        let unset = advertised_spellings(&named("how", None));
+        assert!(matches!(
+            unset,
+            AdvertisedSpellings::BareUnlessContested { listing, bare, .. }
+                if listing == "how" && bare == "how"
+        ));
+
+        let mixed = advertised_spellings(&named("how", Some("Pstack")));
+        assert!(matches!(
+            &mixed,
+            AdvertisedSpellings::BareUnlessContested { bare, .. } if bare == "how"
+        ));
+        assert!(mixed.counted_keys().any(|key| key == "how"));
+    }
+
+    #[test]
+    fn choose_advertised_name_uses_counts_and_blocked() {
+        let open = HashSet::new();
+        let pstack = named("how", Some("pstack"));
+        let chosen = choose_advertised_name(
+            &pstack,
+            &HashMap::new(),
+            &count_map(&[("pstack:how", 1)]),
+            &open,
+        );
+        assert_eq!(
+            chosen,
+            ChosenSlashName {
+                token: Some("pstack:how".to_owned()),
+                collides_with: None,
+            }
+        );
+
+        let blocked_qualified = HashSet::from(["pstack:how".to_owned()]);
+        let chosen = choose_advertised_name(
+            &pstack,
+            &HashMap::new(),
+            &count_map(&[("pstack:how", 1)]),
+            &blocked_qualified,
+        );
+        assert_eq!(chosen.token, None);
+        assert_eq!(chosen.collides_with.as_deref(), Some("pstack:how"));
+
+        let deploy = named("deploy", Some("acme"));
+        let chosen = choose_advertised_name(
+            &deploy,
+            &count_map(&[("deploy", 1)]),
+            &count_map(&[("acme:deploy", 1)]),
+            &open,
+        );
+        assert_eq!(chosen.token.as_deref(), Some("deploy"));
+        assert_eq!(chosen.collides_with, None);
+
+        let login = named("Login", Some("acme"));
+        let blocked = HashSet::from(["login".to_owned()]);
+        let chosen = choose_advertised_name(
+            &login,
+            &count_map(&[("login", 1)]),
+            &count_map(&[("acme:login", 1)]),
+            &blocked,
+        );
+        assert_eq!(chosen.token.as_deref(), Some("acme:login"));
+        assert_eq!(chosen.collides_with.as_deref(), Some("Login"));
+
+        let chosen = choose_advertised_name(
+            &login,
+            &count_map(&[("login", 2)]),
+            &count_map(&[("acme:login", 2)]),
+            &open,
+        );
+        assert_eq!(chosen.token, None);
+        assert_eq!(chosen.collides_with.as_deref(), Some("Login"));
     }
 }
