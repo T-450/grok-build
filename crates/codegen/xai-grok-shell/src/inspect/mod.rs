@@ -12,7 +12,7 @@ use compat::{
     vendor_tag,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -265,11 +265,8 @@ pub(crate) struct SkillEntry {
     pub disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_status: Option<CompatEntryStatus>,
-    /// Bare name this skill lost (`login`, `commit`, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collides_with: Option<String>,
-    /// Qualified invocation when [`Self::collides_with`] is set.
-    /// Absent when that name is contested too.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invocable_as: Option<String>,
 }
@@ -923,13 +920,14 @@ async fn list_skills(
     )
     .await;
 
-    let name_counts = slash_name_counts(&skills);
+    let (bare_counts, qualified_counts) = slash_name_counts(&skills);
     skills
         .into_iter()
         .map(|s| {
             let source = skill_entry_source(&s);
             let vendor = derive_vendor(&s.path).map(String::from);
-            let (collides_with, invocable_as) = slash_collision(&s, &name_counts);
+            let (collides_with, invocable_as) =
+                slash_collision(&s, &bare_counts, &qualified_counts);
             SkillEntry {
                 name: s.label().to_string(),
                 description: s.description,
@@ -946,42 +944,77 @@ async fn list_skills(
         .collect()
 }
 
+fn skill_text_suffix(collides_with: &Option<String>, invocable_as: &Option<String>) -> String {
+    match (collides_with, invocable_as) {
+        (Some(contested), Some(invocable)) => {
+            format!(" [collides with /{contested} → /{invocable}]")
+        }
+        (Some(contested), None) => {
+            format!(" [collides with /{contested} — not invocable]")
+        }
+        (None, Some(invocable)) => format!(" [invoke as /{invocable}]"),
+        (None, None) => String::new(),
+    }
+}
+
 fn slash_name_counts(
     skills: &[xai_grok_agent::prompt::skills::SkillInfo],
-) -> HashMap<String, usize> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+) -> (HashMap<String, usize>, HashMap<String, usize>) {
+    use xai_grok_tools::implementations::skills::skill::{
+        AdvertisedSpellings, advertised_spellings,
+    };
+
+    let mut bare_counts: HashMap<String, usize> = HashMap::new();
+    let mut qualified_counts: HashMap<String, usize> = HashMap::new();
     for skill in skills.iter().filter(|s| s.user_invocable && s.enabled) {
-        *counts.entry(skill.name.to_lowercase()).or_default() += 1;
-        *counts
-            .entry(
-                xai_grok_tools::implementations::skills::skill::format_skill_name(skill)
-                    .to_lowercase(),
-            )
-            .or_default() += 1;
+        let spellings = advertised_spellings(skill);
+        let bare_key = match &spellings {
+            AdvertisedSpellings::BareUnlessContested { bare, .. } => Some(bare.clone()),
+            AdvertisedSpellings::Qualified(_) => None,
+        };
+        for key in spellings.counted_keys() {
+            let counts = if bare_key.as_deref() == Some(key) {
+                &mut bare_counts
+            } else {
+                &mut qualified_counts
+            };
+            *counts.entry(key.to_owned()).or_default() += 1;
+        }
     }
-    counts
+    (bare_counts, qualified_counts)
+}
+
+fn reserved_blocked(
+    bare_counts: &HashMap<String, usize>,
+    qualified_counts: &HashMap<String, usize>,
+) -> HashSet<String> {
+    bare_counts
+        .keys()
+        .chain(qualified_counts.keys())
+        .filter(|key| crate::session::slash_commands::is_reserved_slash_name(key))
+        .cloned()
+        .collect()
 }
 
 fn slash_collision(
     skill: &xai_grok_agent::prompt::skills::SkillInfo,
-    name_counts: &HashMap<String, usize>,
+    bare_counts: &HashMap<String, usize>,
+    qualified_counts: &HashMap<String, usize>,
 ) -> (Option<String>, Option<String>) {
     if !skill.user_invocable || !skill.enabled {
         return (None, None);
     }
-    let name_key = skill.name.to_lowercase();
-    let contested = crate::session::slash_commands::is_reserved_slash_name(&skill.name)
-        || name_counts.get(&name_key).is_some_and(|n| *n > 1);
-    if !contested {
-        return (None, None);
-    }
-    let qualified =
-        xai_grok_tools::implementations::skills::skill::format_skill_name(skill).to_lowercase();
-    let invocable_as = name_counts
-        .get(&qualified)
-        .is_some_and(|n| *n == 1)
-        .then_some(qualified);
-    (Some(skill.name.clone()), invocable_as)
+    let blocked = reserved_blocked(bare_counts, qualified_counts);
+    let chosen = xai_grok_tools::implementations::skills::skill::choose_advertised_name(
+        skill,
+        bare_counts,
+        qualified_counts,
+        &blocked,
+    );
+    let invocable_as = chosen
+        .token
+        .filter(|token| token != &skill.name.to_lowercase());
+    (chosen.collides_with, invocable_as)
 }
 
 /// Prefers the `config_source` stamped at discovery (plugin skills, `[skills].paths` entries), then falls back to the discovered scope.
@@ -1663,15 +1696,7 @@ fn print_human(r: &InspectReport, out: &mut impl Write) -> std::io::Result<()> {
         |s| s.name.clone(),
         |s| {
             let status = disabled_compat_tags(s.disabled, s.compatibility_status);
-            let collision = match (&s.collides_with, &s.invocable_as) {
-                (Some(contested), Some(invocable)) => {
-                    format!(" [collides with /{contested} → /{invocable}]")
-                }
-                (Some(contested), None) => {
-                    format!(" [collides with /{contested} — not invocable]")
-                }
-                _ => String::new(),
-            };
+            let collision = skill_text_suffix(&s.collides_with, &s.invocable_as);
             format!(
                 "{}{}{}{}",
                 s.source.display_label(),
@@ -2601,7 +2626,8 @@ mod tests {
 
     fn collision_entry(skill: &SkillInfo, all: &[SkillInfo]) -> SkillEntry {
         let mut entry = blank_skill_entry(skill);
-        let (collides_with, invocable_as) = slash_collision(skill, &slash_name_counts(all));
+        let (bare_counts, qualified_counts) = slash_name_counts(all);
+        let (collides_with, invocable_as) = slash_collision(skill, &bare_counts, &qualified_counts);
         entry.collides_with = collides_with;
         entry.invocable_as = invocable_as;
         entry
@@ -2659,6 +2685,40 @@ mod tests {
         let entry = collision_entry(first, &all);
         assert_eq!(entry.collides_with.as_deref(), Some("commit"));
         assert_eq!(entry.invocable_as, None);
+    }
+
+    #[test]
+    fn apply_slash_collision_qualifies_unique_pstack_skill() {
+        let mut how = skill_fixture(
+            "how",
+            "/plugins/pstack/skills/how/SKILL.md",
+            SkillScope::Plugin,
+        );
+        how.plugin_name = Some("pstack".into());
+        let mut deploy = skill_fixture(
+            "deploy",
+            "/plugins/acme/skills/deploy/SKILL.md",
+            SkillScope::Plugin,
+        );
+        deploy.plugin_name = Some("acme".into());
+        let all = [how, deploy];
+        let [how, deploy] = &all;
+
+        let entry = collision_entry(how, &all);
+        assert_eq!(entry.invocable_as.as_deref(), Some("pstack:how"));
+        assert_eq!(entry.collides_with, None);
+        assert_eq!(
+            skill_text_suffix(&entry.collides_with, &entry.invocable_as),
+            " [invoke as /pstack:how]"
+        );
+
+        let entry = collision_entry(deploy, &all);
+        assert_eq!(entry.collides_with, None);
+        assert_eq!(entry.invocable_as, None);
+        assert_eq!(
+            skill_text_suffix(&entry.collides_with, &entry.invocable_as),
+            ""
+        );
     }
 
     /// A `config_source` stamped at discovery (plugins, `[skills].paths`) wins over the scope fallback.

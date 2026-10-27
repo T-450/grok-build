@@ -2,7 +2,9 @@
 use agent_client_protocol as acp;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
-use xai_grok_tools::implementations::skills::skill::format_skill_name;
+use xai_grok_tools::implementations::skills::skill::{
+    AdvertisedSpellings, advertised_spellings, choose_advertised_name, format_skill_name,
+};
 use xai_grok_tools::implementations::skills::types::{SkillInfo, SkillScope};
 pub(crate) struct BuiltinCommand {
     pub name: &'static str,
@@ -625,28 +627,31 @@ impl<'a> EffectiveSkillCatalog<'a> {
         let mut bare_counts: HashMap<String, usize> = HashMap::new();
         let mut qualified_counts: HashMap<String, usize> = HashMap::new();
         for skill in &candidates {
-            *bare_counts.entry(slash_key(&skill.name)).or_default() += 1;
-            *qualified_counts
-                .entry(slash_key(&format_skill_name(skill)))
-                .or_default() += 1;
+            let spellings = advertised_spellings(skill);
+            let bare_key = match &spellings {
+                AdvertisedSpellings::BareUnlessContested { bare, .. } => Some(bare.clone()),
+                AdvertisedSpellings::Qualified(_) => None,
+            };
+            for key in spellings.counted_keys() {
+                let counts = if bare_key.as_deref() == Some(key) {
+                    &mut bare_counts
+                } else {
+                    &mut qualified_counts
+                };
+                *counts.entry(key.to_owned()).or_default() += 1;
+            }
         }
         let mut commands = Vec::new();
         for skill in candidates {
-            let bare_key = slash_key(&skill.name);
-            let name = if bare_counts.get(&bare_key) == Some(&1) && !taken.contains(&bare_key) {
-                bare_key
-            } else {
-                let qualified = slash_key(&format_skill_name(skill));
-                if qualified_counts.get(&qualified) != Some(&1) || taken.contains(&qualified) {
-                    tracing::debug!(
-                        skill = %skill.name,
-                        path = %skill.path,
-                        %qualified,
-                        "skill not advertised: both its bare and qualified names are taken"
-                    );
-                    continue;
-                }
-                qualified
+            let chosen = choose_advertised_name(skill, &bare_counts, &qualified_counts, &taken);
+            let Some(name) = chosen.token else {
+                tracing::debug!(
+                    skill = %skill.name,
+                    path = %skill.path,
+                    contested = ?chosen.collides_with,
+                    "skill not advertised: slash name is taken"
+                );
+                continue;
             };
             taken.insert(name.clone());
             commands.push(SkillCommand { name, skill });

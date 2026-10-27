@@ -1195,6 +1195,64 @@ fn make_plugin_skill(name: &str, plugin: &str) -> SkillInfo {
 }
 
 #[test]
+fn available_commands_pstack_how_is_qualified_and_resolves() {
+    let skills = vec![make_plugin_skill("how", "pstack")];
+    let names: Vec<String> = available_commands(&skills, all_gated(), &[])
+        .into_iter()
+        .map(|command| command.name)
+        .collect();
+    assert!(names.iter().any(|name| name == "pstack:how"), "{names:?}");
+    assert!(!names.iter().any(|name| name == "how"), "{names:?}");
+
+    assert!(
+        resolve(
+            vec![text_block("/how")],
+            &skills,
+            all_gated(),
+            SkillSlashRewrite::default(),
+            &[],
+        )
+        .is_ok()
+    );
+    let outcome = resolve(
+        vec![text_block("/pstack:how now")],
+        &skills,
+        all_gated(),
+        SkillSlashRewrite::default(),
+        &[],
+    )
+    .unwrap_err();
+    let skill = first_skill(outcome);
+    assert_eq!(skill.name, "pstack:how");
+    assert_eq!(skill.args, "now");
+    assert_eq!(skill.plugin_name.as_deref(), Some("pstack"));
+
+    let outcome = super::resolve_model_authored_skill(
+        vec![text_block("/pstack:how now")],
+        "pstack:how",
+        "now",
+        &skills,
+        all_gated(),
+        true,
+    )
+    .unwrap_err();
+    let skill = first_skill(outcome);
+    assert_eq!(skill.name, "pstack:how");
+    assert_eq!(skill.args, "now");
+    assert!(
+        super::resolve_model_authored_skill(
+            vec![text_block("/how")],
+            "how",
+            "",
+            &skills,
+            all_gated(),
+            true,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn plugin_login_skill_resolves_by_qualified_name_only() {
     let skills = vec![make_plugin_skill("login", "acme")];
 

@@ -177,6 +177,8 @@ When a skill's name collides with another skill or a built-in command, Grok keep
 /acme:login          # A plugin skill named "login" (built-in /login is unchanged)
 ```
 
+A skill from the pstack plugin is always `/pstack:<name>`, including when that bare name is free. When you select it in the slash menu, Grok inserts that command.
+
 Typing `/login` in the slash menu shows both rows, with a right-aligned **built-in** or **skill · plugin-name** badge so you can tell them apart. Rename the skill (or its directory) if you want the bare `/name` for the skill instead.
 
 `grok inspect` tags colliding skills with `[collides with /login → /acme:login]`.

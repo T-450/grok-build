@@ -3,8 +3,10 @@
 //! Converts a slice of `SkillInfo` into a `<system-reminder>` string that fits
 //! within a character budget derived from the model's context window.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
+use crate::implementations::skills::skill::{AdvertisedSpellings, advertised_spellings};
 use crate::implementations::skills::types::{SkillInfo, SkillScope};
 use crate::util::truncate_str_with_marker;
 
@@ -55,7 +57,7 @@ pub(super) fn is_listable(s: &SkillInfo) -> bool {
 
 /// A single skill entry to be rendered in a listing announcement.
 struct SkillEntry<'a> {
-    name: &'a str,
+    name: Cow<'a, str>,
     description: &'a str,
     when_to_use: Option<&'a str>,
     display_path: String,
@@ -140,17 +142,18 @@ impl<'a> SkillEntry<'a> {
     /// description after an em-dash: `description — Use when: trigger phrases`.
     fn format_xml(&self, func_desc: &str, desc_budget: usize, wtu_budget: usize) -> String {
         let desc = truncate_str_with_marker(func_desc, desc_budget);
+        let attrs = self.xml_attrs(xml_attr_escape);
         if let Some(wtu) = self.when_to_use {
             let wtu = truncate_str_with_marker(strip_leading_trigger_prefix(wtu), wtu_budget);
             format!(
-                "<agent_skill fullPath=\"{}\">{} \u{2014} Use when: {}</agent_skill>\n",
+                "<agent_skill{attrs} fullPath=\"{}\">{} \u{2014} Use when: {}</agent_skill>\n",
                 xml_attr_escape(&self.display_path),
                 xml_text_escape(&desc),
                 xml_text_escape(&wtu),
             )
         } else {
             format!(
-                "<agent_skill fullPath=\"{}\">{}</agent_skill>\n",
+                "<agent_skill{attrs} fullPath=\"{}\">{}</agent_skill>\n",
                 xml_attr_escape(&self.display_path),
                 xml_text_escape(&desc),
             )
@@ -162,14 +165,15 @@ impl<'a> SkillEntry<'a> {
         format!(
             "<agent_skill fullPath=\"{}\">{}</agent_skill>\n",
             xml_attr_escape(&self.display_path),
-            xml_text_escape(self.name),
+            xml_text_escape(&self.name),
         )
     }
 
     /// Byte length of the fixed XML overhead excluding description body.
     fn overhead_xml(&self) -> usize {
         let base = "<agent_skill fullPath=\"\"></agent_skill>\n".len()
-            + xml_attr_escape(&self.display_path).len();
+            + xml_attr_escape(&self.display_path).len()
+            + self.xml_attrs(xml_attr_escape).len();
         if self.when_to_use.is_some() {
             base + " \u{2014} Use when: ".len()
         } else {
@@ -183,24 +187,38 @@ impl<'a> SkillEntry<'a> {
     /// is escaped to `&quot;` Body content: no XML escaping (passed through verbatim)
     /// Empty/whitespace-only description: self-closing `<agent_skill fullPath="..." />`
     fn format_xml_verbatim(&self) -> String {
+        let attrs = self.xml_attrs(jsx_attr_escape);
         if self.description.trim().is_empty() {
             format!(
-                "<agent_skill fullPath=\"{}\" />\n",
+                "<agent_skill{attrs} fullPath=\"{}\" />\n",
                 jsx_attr_escape(&self.display_path),
             )
         } else if let Some(wtu) = self.when_to_use {
             format!(
-                "<agent_skill fullPath=\"{}\">{} Use when: {}</agent_skill>\n",
+                "<agent_skill{attrs} fullPath=\"{}\">{} Use when: {}</agent_skill>\n",
                 jsx_attr_escape(&self.display_path),
                 self.description,
                 wtu,
             )
         } else {
             format!(
-                "<agent_skill fullPath=\"{}\">{}</agent_skill>\n",
+                "<agent_skill{attrs} fullPath=\"{}\">{}</agent_skill>\n",
                 jsx_attr_escape(&self.display_path),
                 self.description,
             )
+        }
+    }
+
+    fn xml_attrs(&self, escape: impl Fn(&str) -> String) -> String {
+        let same = std::path::Path::new(&self.display_path)
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            == Some(self.name.as_ref());
+        if same {
+            String::new()
+        } else {
+            format!(" name=\"{}\"", escape(self.name.as_ref()))
         }
     }
 }
@@ -507,8 +525,12 @@ fn build_skill_entry<'a>(
     } else {
         None
     };
+    let name = match advertised_spellings(s) {
+        AdvertisedSpellings::Qualified(qualified) => Cow::Owned(qualified),
+        AdvertisedSpellings::BareUnlessContested { .. } => Cow::Borrowed(s.name.as_str()),
+    };
     SkillEntry {
-        name: &s.name,
+        name,
         description: &s.description,
         when_to_use: wtu,
         display_path: match (real_prefix, display_prefix) {
@@ -537,7 +559,8 @@ pub enum XmlRenderMode {
 
 /// Render a skill listing as `<agent_skill>` XML rows. Output is a sequence of `<agent_skill fullPath="...">description</agent_skill>` rows
 /// separated by blank lines (no enclosing `<agent_skills>` envelope --the caller wraps it). The skill name is implicit in the parent directory
-/// of `fullPath`. Filters out skills with `disable_model_invocation` and those already in `announced` (dedup).
+/// of `fullPath`, unless that directory is not the printed token, in which case the row also has a `name` attribute.
+/// Filters out skills with `disable_model_invocation` and those already in `announced` (dedup).
 pub fn format_announcement_xml(
     skills: &[SkillInfo],
     announced: &mut HashSet<String>,
@@ -751,7 +774,7 @@ mod tests {
     fn proportional_budgets_covers_all_branches() {
         fn entry<'a>(desc: &'a str, wtu: Option<&'a str>) -> SkillEntry<'a> {
             SkillEntry {
-                name: "s",
+                name: Cow::Borrowed("s"),
                 description: desc,
                 when_to_use: wtu,
                 display_path: "/p/SKILL.md".to_owned(),
@@ -1484,6 +1507,51 @@ mod tests {
     }
 
     #[test]
+    fn format_announcement_prints_qualified_pstack_name() {
+        let mut pstack = skill("how", "Do the thing.");
+        pstack.plugin_name = Some("pstack".to_owned());
+        pstack.scope = SkillScope::Plugin;
+        pstack.has_user_specified_description = true;
+        pstack.path = "/plugins/pstack/skills/how/SKILL.md".to_owned();
+        let user = skill("deploy", "Ship it.");
+        let text = announce(&[pstack.clone(), user.clone()], 8_000).unwrap();
+        assert!(
+            text.contains("- pstack:how:"),
+            "pstack row should use the qualified token: {text}"
+        );
+        assert!(
+            text.contains(&format!("- {}:", user.name)),
+            "user row should keep SkillInfo.name: {text}"
+        );
+        assert!(!text.contains("\n- how:"), "no bare pstack row: {text}");
+
+        let mut announced = HashSet::new();
+        let xml = format_announcement_xml(
+            &[pstack, user],
+            &mut announced,
+            None,
+            None,
+            XmlRenderMode::Budgeted {
+                budget_chars: Some(8_000),
+                overflow_indicator: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            xml.contains("name=\"pstack:how\""),
+            "qualified token is not the directory name: {xml}"
+        );
+        assert!(
+            !xml.contains("name=\"deploy\""),
+            "matching directory stays without a name attribute: {xml}"
+        );
+        assert!(
+            xml.contains("<agent_skill fullPath=\"/skills/deploy/SKILL.md\">"),
+            "user row stays byte-identical: {xml}"
+        );
+    }
+
+    #[test]
     fn format_announcement_no_extraction_when_no_prefix() {
         let skills = [skill("plain", "A plain description with no triggers.")];
         let mut announced = HashSet::new();
@@ -1613,13 +1681,13 @@ mod tests {
     #[test]
     fn overhead_larger_with_when_to_use() {
         let without = SkillEntry {
-            name: "s",
+            name: Cow::Borrowed("s"),
             description: "desc",
             when_to_use: None,
             display_path: "/p/SKILL.md".to_owned(),
         };
         let with = SkillEntry {
-            name: "s",
+            name: Cow::Borrowed("s"),
             description: "desc",
             when_to_use: Some("trigger"),
             display_path: "/p/SKILL.md".to_owned(),
@@ -1778,13 +1846,13 @@ mod tests {
     #[test]
     fn xml_overhead_includes_em_dash_separator() {
         let without = SkillEntry {
-            name: "s",
+            name: Cow::Borrowed("s"),
             description: "desc",
             when_to_use: None,
             display_path: "/p/SKILL.md".to_owned(),
         };
         let with_wtu = SkillEntry {
-            name: "s",
+            name: Cow::Borrowed("s"),
             description: "desc",
             when_to_use: Some("trigger"),
             display_path: "/p/SKILL.md".to_owned(),
